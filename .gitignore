@@ -8,3 +8,5 @@
 /vggt/
 __pycache__/
 *.pyc
+/gsplat
+/gsplat/

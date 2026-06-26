@@ -1,0 +1,6 @@
+name: cv
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+prefix: /home/yx/miniconda3/envs/cv
