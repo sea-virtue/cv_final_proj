@@ -1,0 +1,8 @@
+# 额外依赖 — 在已有 vggt/requirements_demo.txt 基础上新增
+# 安装: pip install -r pipeline/requirements_extra.txt
+
+gsplat>=1.0.0          # 3D Gaussian Splatting 训练 (PyTorch原生)
+viser>=0.2.23          # 实时3D渲染 (Web端)
+opencv-python>=4.8     # SIFT特征提取 (可能需要: pip install opencv-contrib-python)
+scipy>=1.10            # 稀疏矩阵 / 优化
+tqdm>=4.65             # 进度条

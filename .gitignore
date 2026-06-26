@@ -1,0 +1,10 @@
+/output
+/.pkgs
+/.reasonix
+/.vscode
+/.agents
+/.codex
+/vggt
+/vggt/
+__pycache__/
+*.pyc
