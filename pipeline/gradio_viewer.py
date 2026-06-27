@@ -108,10 +108,22 @@ def _read_gaussian_ply(ply_path):
         return np.tile(np.asarray(default, dtype=np.float32), (N, 1))
 
     means = cols(["x", "y", "z"])
-    colors = cols(["f_dc_0", "f_dc_1", "f_dc_2"]) / 0.28209479177387814
+    sh0 = cols(["f_dc_0", "f_dc_1", "f_dc_2"])
+    if float(np.nanmin(sh0)) < -0.01 or float(np.nanmax(sh0)) > 0.35:
+        # Standard 3DGS / gsplat PLY stores DC SH as (rgb - 0.5) / C0.
+        colors = sh0 * 0.28209479177387814 + 0.5
+    else:
+        # Older project PLY files stored rgb * C0.
+        colors = sh0 / 0.28209479177387814
     colors = np.clip(colors, 0.0, 1.0)
     opacities = values[:, prop_idx["opacity"]] if "opacity" in prop_idx else np.ones(N, dtype=np.float32)
+    if np.isfinite(opacities).any() and (float(np.nanmin(opacities)) < 0.0 or float(np.nanmax(opacities)) > 1.0):
+        # Standard 3DGS stores logit opacity; older project files store alpha.
+        opacities = 1.0 / (1.0 + np.exp(-opacities))
     scales = cols(["scale_0", "scale_1", "scale_2"], default=[0.01, 0.01, 0.01])
+    if np.isfinite(scales).any() and float(np.nanmin(scales)) <= 0.0:
+        # Standard 3DGS stores log-scales; older project files store positive scales.
+        scales = np.exp(scales)
     quats = cols(["rot_0", "rot_1", "rot_2", "rot_3"], default=[1.0, 0.0, 0.0, 0.0])
     return means, colors, opacities, scales, quats
 
@@ -154,6 +166,18 @@ def _add_gaussian_ellipsoid_preview(scene, means, colors_uint8, scales, quats,
     return count
 
 
+def _step3_glb_transform(extrinsics):
+    """Transform original reconstruction coordinates into the Step 3 GLB view."""
+    from visual_util import get_opengl_conversion_matrix
+
+    ext_4x4 = np.eye(4, dtype=np.float32)
+    ext_4x4[:3, :4] = extrinsics[0]
+    opengl = get_opengl_conversion_matrix().astype(np.float32)
+    align = np.eye(4, dtype=np.float32)
+    align[:3, :3] = Rotation.from_euler("y", 180, degrees=True).as_matrix()
+    return np.linalg.inv(ext_4x4) @ opengl @ align
+
+
 def _build_glb_step3(ply_path, predictions, ba_data, output_dir, conf_thres,
                      gaussian_display="Centers", ellipsoid_count=1200):
     """Step 3: 3DGS Gaussians from .ply."""
@@ -182,12 +206,13 @@ def _build_glb_step3(ply_path, predictions, ba_data, output_dir, conf_thres,
         )
     scene.metadata["ellipsoid_count"] = ellipsoid_added
 
+    extrinsics = ba_data["extrinsic_opt"] if ba_data is not None else predictions["extrinsic"]
+
     # 添加 BA 相机
     if ba_data is not None:
         from visual_util import integrate_camera_into_scene
         import matplotlib
         colormap = matplotlib.colormaps.get_cmap("gist_rainbow")
-        extrinsics = ba_data["extrinsic_opt"]
         S = extrinsics.shape[0]
         ext_4x4 = np.zeros((S, 4, 4))
         ext_4x4[:, :3, :4] = extrinsics
@@ -203,12 +228,7 @@ def _build_glb_step3(ply_path, predictions, ba_data, output_dir, conf_thres,
             color = tuple(int(255 * x) for x in rgba[:3])
             integrate_camera_into_scene(scene, c2w, color, scene_scale)
 
-        from visual_util import get_opengl_conversion_matrix
-        from scipy.spatial.transform import Rotation
-        opengl = get_opengl_conversion_matrix()
-        align = np.eye(4)
-        align[:3, :3] = Rotation.from_euler("y", 180, degrees=True).as_matrix()
-        scene.apply_transform(np.linalg.inv(ext_4x4[0]) @ opengl @ align)
+    scene.apply_transform(_step3_glb_transform(extrinsics))
 
     return scene
 
@@ -371,7 +391,7 @@ def _look_at_world_to_camera(eye, target):
     return extrinsic
 
 
-def _orbit_view_to_extrinsic(view_state_json, means):
+def _orbit_view_to_extrinsic(view_state_json, means, display_transform=None):
     if not view_state_json:
         return None
     try:
@@ -384,6 +404,26 @@ def _orbit_view_to_extrinsic(view_state_json, means):
     if theta is None or phi is None or radius is None or radius <= 0:
         return None
 
+    if display_transform is not None:
+        display_target = state.get("target")
+        if display_target is None:
+            means_h = np.concatenate([means, np.ones((len(means), 1), dtype=np.float32)], axis=1)
+            display_means = (display_transform @ means_h.T).T[:, :3]
+            target_display = np.median(display_means, axis=0)
+        else:
+            target_display = np.asarray(display_target, dtype=np.float32)
+        offset_display = np.array([
+            radius * np.sin(phi) * np.sin(theta),
+            radius * np.cos(phi),
+            radius * np.sin(phi) * np.cos(theta),
+        ], dtype=np.float32)
+        eye_display = target_display + offset_display
+
+        inv_display = np.linalg.inv(display_transform)
+        eye = (inv_display @ np.append(eye_display, 1.0))[:3]
+        target = (inv_display @ np.append(target_display, 1.0))[:3]
+        return _look_at_world_to_camera(eye, target)
+
     target = np.median(means, axis=0)
     offset = np.array([
         radius * np.sin(phi) * np.sin(theta),
@@ -394,8 +434,8 @@ def _orbit_view_to_extrinsic(view_state_json, means):
     return _look_at_world_to_camera(eye, target)
 
 
-def render_splatting_rgb(dataset_name, frame_filter):
-    """Render a true gsplat RGB image from the selected dataset camera."""
+def render_splatting_rgb(dataset_name, frame_filter, view_state_json=None):
+    """Render a true gsplat RGB image from the current browser view if available."""
     if not dataset_name:
         return None, "请选择数据集。"
     if not torch.cuda.is_available():
@@ -437,9 +477,14 @@ def render_splatting_rgb(dataset_name, frame_filter):
     opacities, scales, quats = opacities[valid], scales[valid], quats[valid]
     scales = np.clip(scales, 1e-4, np.percentile(scales, 99) * 2.0)
 
+    display_transform = _step3_glb_transform(extrinsics)
+    orbit_extrinsic = _orbit_view_to_extrinsic(view_state_json, means, display_transform)
+    render_extrinsic = orbit_extrinsic if orbit_extrinsic is not None else extrinsics[frame_idx]
+    camera_source = "当前浏览器视角" if orbit_extrinsic is not None else f"显示帧相机 frame {frame_idx}"
+
     device = "cuda"
     viewmat = torch.eye(4, device=device, dtype=torch.float32)
-    viewmat[:3, :4] = torch.from_numpy(extrinsics[frame_idx]).to(device=device, dtype=torch.float32)
+    viewmat[:3, :4] = torch.from_numpy(render_extrinsic).to(device=device, dtype=torch.float32)
     K = torch.from_numpy(intrinsics[frame_idx]).to(device=device, dtype=torch.float32)
 
     try:
@@ -468,9 +513,10 @@ def render_splatting_rgb(dataset_name, frame_filter):
     render_dir = os.path.join(output_dir, "renders")
     os.makedirs(render_dir, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_path = os.path.join(render_dir, f"web_splat_frame_{frame_idx:04d}_{stamp}.png")
+    view_tag = "orbit" if orbit_extrinsic is not None else f"frame_{frame_idx:04d}"
+    save_path = os.path.join(render_dir, f"web_splat_{view_tag}_{stamp}.png")
     cv2.imwrite(save_path, cv2.cvtColor((image_np * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
-    return save_path, f"已按显示帧相机渲染 3DGS RGB 图：{save_path}"
+    return save_path, f"已按{camera_source}渲染 3DGS RGB 图：{save_path}"
 
 
 # ---------------------------------------------------------------------------
@@ -520,7 +566,17 @@ def build_ui():
                        if (!Number.isFinite(theta) || !Number.isFinite(phi) || !Number.isFinite(radius)) {
                          return [''];
                        }
-                       return [JSON.stringify({theta, phi, radius})];
+                       let target = null;
+                       if (typeof modelViewer.getCameraTarget === 'function') {
+                         const cameraTarget = modelViewer.getCameraTarget();
+                         const x = unitValue(cameraTarget.x, 'm');
+                         const y = unitValue(cameraTarget.y, 'm');
+                         const z = unitValue(cameraTarget.z, 'm');
+                         if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z)) {
+                           target = [x, y, z];
+                         }
+                       }
+                       return [JSON.stringify({theta, phi, radius, target})];
                      };
                      window.saveCurrentModel3DView = () => {
                        const root = document.querySelector('#model3d-viewer');
@@ -584,6 +640,7 @@ def build_ui():
                     save_view_btn = gr.Button("保存当前视图 PNG", variant="secondary")
                     render_rgb_btn = gr.Button("渲染3DGS RGB图", variant="primary")
                     save_view_status = gr.Markdown("")
+                current_view_state = gr.Textbox(visible=False)
                 rendered_rgb = gr.Image(label="3DGS RGB 渲染图", type="filepath", height=320)
 
         def reload(ds, stage, conf, ff, cam, mb, mw, pm, gd, ec):
@@ -610,8 +667,14 @@ def build_ui():
         )
         render_rgb_btn.click(
             fn=render_splatting_rgb,
-            inputs=[dataset_dd, frame_filter],
+            inputs=[dataset_dd, frame_filter, current_view_state],
             outputs=[rendered_rgb, save_view_status],
+            js="""
+            (datasetName, frameFilter, currentViewState) => {
+              const state = window.getModel3DOrbitState ? window.getModel3DOrbitState()[0] : "";
+              return [datasetName, frameFilter, state || currentViewState || ""];
+            }
+            """,
         )
 
     return demo
