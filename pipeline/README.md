@@ -13,7 +13,9 @@
 │   ├── vggt_inference.py             # VGGT推理 → 相机位姿 + 深度图 + 点云
 │   ├── bundle_adjustment.py          # Bundle Adjustment 优化相机外参和3D点
 │   ├── gaussian_splatting.py         # 3D Gaussian Splatting 训练
+│   ├── gsplat_training.py            # 推荐 3DGS 训练入口：使用 gsplat 官方策略
 │   ├── gradio_viewer.py              # 推荐 Web 查看器：菜单切换 Step 1/2/3
+│   ├── gsplat_viewer.py              # 独立 gsplat 官方 viewer 启动器
 │   ├── render_gaussian_image.py      # 指定相机视角渲染 3DGS PNG
 │   ├── gs_viewer.py                  # 旧版 viser 查看器（当前不作为主入口）
 │   ├── vggt_improvements.md          # VGGT改进方法调研文档
@@ -23,7 +25,7 @@
 │   │   ├── predictions.npz           # VGGT原始输出
 │   │   ├── ba_result.npz             # BA优化结果
 │   │   ├── gaussians.ply             # 3DGS训练好的高斯球
-│   │   └── gs_train_loss.png         # 训练损失曲线
+│   │   └── gsplat_train_loss.png     # 训练损失曲线
 │   ├── 数据2-人体/
 │   │   └── ...（同上结构）
 │   └── 数据3-场景/
@@ -158,9 +160,9 @@ python pipeline/bundle_adjustment.py --dataset 数据3-场景.mp4
 ### 第3步：3D Gaussian Splatting 训练（3DGS优化与渲染）
 
 ```bash
-python pipeline/gaussian_splatting.py --dataset 数据1-人体 --steps 7000
-python pipeline/gaussian_splatting.py --dataset 数据2-人体 --steps 7000
-python pipeline/gaussian_splatting.py --dataset 数据3-场景.mp4 --steps 7000
+python pipeline/gsplat_training.py --dataset 数据1-人体 --steps 7000
+python pipeline/gsplat_training.py --dataset 数据2-人体 --steps 7000
+python pipeline/gsplat_training.py --dataset 数据3-场景.mp4 --steps 7000
 ```
 
 **3DGS 实现细节**：
@@ -169,21 +171,37 @@ python pipeline/gaussian_splatting.py --dataset 数据3-场景.mp4 --steps 7000
    - 颜色：对应图像像素 RGB
    - 不透明度：基于置信度映射
    - 缩放：基于 KNN 最近邻距离估计
-   - 旋转：方向对齐到相机视线
-2. 使用 `gsplat` 库进行可微光栅化训练
-3. 损失：0.8 × L1 + 0.2 × SSIM
-4. 优化器：Adam (lr=1e-2)，按参数类型分组学习率
-5. 周期性剪枝：移除不透明度 < 0.01 的 Gaussians
-6. 梯度裁剪：max_norm=1.0
+   - 旋转：随机四元数初始化并在训练中优化
+   - 背景处理默认 `auto`：人体数据检测到 `msk_*.png` 时自动合成黑背景训练；场景视频没有 mask 时保留原始 RGB，不做扣绿
+   - 使用 BA 相机时，会把 VGGT depth 按 BA 外参重新反投影，保证 dense 初始化点云和训练相机处在同一坐标关系中
+2. 使用 `gsplat` 的 `rasterization` 进行可微光栅化训练
+3. 使用 `gsplat` 的 `DefaultStrategy` 做 Gaussian 增密、拆分、裁剪和 opacity reset
+4. 损失：0.8 × L1 + 0.2 × SSIM；人体前景默认加权，避免黑背景像素过多导致人物监督太弱
+5. 优化器：按 `means / scales / quats / opacities / SH` 分组 Adam
+6. 使用 `gsplat.export_splats()` 导出标准 3DGS PLY
 
 **可选参数**：
 - `--steps`: 训练步数（默认 7000）
 - `--max-points`: 最大初始 Gaussians 数量（默认 150k）
 - `--no-ba`: 使用 VGGT 原始位姿而非 BA 优化后的
+- `--no-mask-loss`: 不使用人体 mask；默认会自动使用可用的 `msk_*.png`
+- `--bg-mode`: 背景处理方式，默认 `auto`；人体 mask 数据自动使用 `mask-black`，普通场景自动使用 `original`。也可手动指定 `chroma-black` 用 RGB 通道扣绿，`foreground-only` 只在前景计算 loss，`original` 保留原图背景
+- `--foreground-loss-weight`: 人体前景 L1 权重（默认 8.0）
+- `--no-reproject-depth-with-poses`: 关闭 BA 相机下的 dense depth 重新反投影
+- `--use-local-gsplat`: 强制从项目内 `./gsplat` 源码导入；通常会触发本地 CUDA 扩展编译，需要 nvcc。默认使用当前环境中已安装的 gsplat wheel，更稳定。
+
+旧版简化训练脚本仍保留：
+
+```bash
+python pipeline/gaussian_splatting.py --dataset 数据1-人体 --steps 7000
+```
+
+旧脚本便于阅读实现，但增密/裁剪和 PLY 导出格式更简化；推荐答辩和最终结果使用 `gsplat_training.py`。
 
 **输出**：
 - `output/<dataset>/gaussians.ply`：训练好的 3D Gaussians
-- `output/<dataset>/gs_train_loss.png`：训练损失曲线
+- `output/<dataset>/gsplat_train_loss.png`：训练损失曲线
+- `output/<dataset>/renders/gsplat_train_preview_0000.png`：训练后预览渲染图
 
 **预计时间**：每数据集 10-30 分钟（取决于点数）
 
@@ -201,10 +219,10 @@ python pipeline/gradio_viewer.py
 - **Step 2: VGGT + BA**：VGGT 点云 + BA 优化后的相机
 - **Step 3: 3DGS**：训练后的 Gaussian 点集；可切换中心点显示或采样椭球预览
 
-这里的“实时交互渲染”指结果加载后可以在 Web 页面中实时旋转、缩放、平移、切换数据集和阶段，用于展示重建结果。Web 页面提供两个输出按钮：
+这里的“实时交互渲染”包含两层含义：一是 Web 页面中可以实时旋转、缩放、平移、切换数据集和阶段，用于展示重建结构；二是可以基于当前交互视角调用 `gsplat` 输出一张真正的 3DGS RGB 渲染图。Web 页面提供两个输出按钮：
 
 - **保存当前视图 PNG**：保存浏览器当前 3D 预览画面，适合展示交互查看结果。
-- **渲染3DGS RGB图**：使用 `gsplat` 从训练好的 `gaussians.ply` 按当前“显示帧”相机视角渲染 RGB 图，并保存到 `output/<dataset>/renders/`。
+- **渲染3DGS RGB图**：使用 `gsplat` 从训练好的 `gaussians.ply` 按浏览器当前拖动视角渲染 RGB 图，并保存到 `output/<dataset>/renders/`；如果浏览器视角读取失败，则自动退回当前“显示帧”相机视角。
 
 完整 Gaussian 数量通常很大，Web 端默认显示 Gaussian 中心点；如需展示高斯的尺度和旋转，可选择 “Centers + Ellipsoid Preview”，查看抽样椭球。
 
@@ -221,9 +239,115 @@ python pipeline/render_gaussian_image.py --dataset 数据1-人体 --frame 0 --ya
 - `--port`: 端口号（默认 7860）
 - `--share`: 生成 Gradio 临时公网链接
 
-`pipeline/gs_viewer.py` 是旧版 viser 查看器，当前结果查看统一使用 `pipeline/gradio_viewer.py`。
+`pipeline/gs_viewer.py` 是旧版 viser 查看器，当前三阶段对比统一使用 `pipeline/gradio_viewer.py`。
+
+如果想直接尝试 gsplat 官方 viewer，可运行：
+
+```bash
+python pipeline/gsplat_viewer.py --dataset 数据1-人体 --port 8080
+```
+
+该入口直接读取 `output/<dataset>/gaussians.ply`，并使用当前环境中已安装的 `gsplat` wheel 进行实时 RGB 光栅化。它比 Gradio 的 GLB 预览更接近真正的 3DGS 交互渲染，但需要额外依赖：
+
+```bash
+python -m pip install viser splines
+python -m pip install 'git+https://github.com/nerfstudio-project/nerfview@4538024fe0d15fd1a0e4d760f3695fc44ca72787'
+```
+
+如果只需要三阶段对比，仍使用 `gradio_viewer.py`；如果只想看 3DGS 自身的交互式 RGB 渲染，使用 `gsplat_viewer.py`。
+
+室内场景类数据不要按“外部模型”去看。`数据3-场景` 这种相机在场景内部移动的数据，更适合从训练相机附近向四周看：
+
+```bash
+python pipeline/gsplat_viewer.py --dataset 数据3-场景 --port 8080 --view-mode inside
+```
+
+默认 `--view-mode auto` 会对名字包含“场景”的数据自动使用 inside 初始视角。网页右侧也会出现 **Inside view** 按钮，点一下可以回到场景内部的训练相机视角。`--view-frame N` 可以指定使用第 N 帧训练相机作为初始视角。
+
+完整推荐流程：
+
+```bash
+# Step 1: VGGT
+python pipeline/vggt_inference.py --dataset 数据1-人体
+
+# Step 2: BA
+python pipeline/bundle_adjustment.py --dataset 数据1-人体
+
+# Step 3: 3DGS，默认用 BA 位姿 + mask-black 背景处理
+python pipeline/gsplat_training.py --dataset 数据1-人体 --steps 7000
+
+# 三阶段对比
+python pipeline/gradio_viewer.py
+
+# 独立 3DGS 实时 RGB viewer
+python pipeline/gsplat_viewer.py --dataset 数据1-人体 --port 8080
+```
 
 ---
+
+## 提高 3DGS 精度的建议
+
+当前人物粗糙、不平滑，通常不是单一原因，而是以下因素叠加：
+
+1. **VGGT 初始点云精度会影响 3DGS 上限**  
+   3DGS 的 Gaussian 位置从 VGGT 点云初始化。如果 VGGT 深度在人体边界、衣服褶皱、手脚等区域有噪声，3DGS 后面会在错误位置开始优化，容易出现毛刺、漂浮点或表面粗糙。BA 主要修相机外参，并不会把 VGGT 的稠密深度图完全变准。
+
+2. **BA 影响多视角一致性**  
+   如果相机位姿不准，同一个人体点在不同视角下投影位置对不上，3DGS 会收到互相冲突的 RGB 监督，表现为模糊、重影、边缘发散。BA 后重投影误差越低，3DGS 越容易收敛。
+
+3. **训练步数会影响收敛，但不是无限增加就一定好**  
+   `--steps 7000` 是演示级别。想更细，可以尝试：
+
+   ```bash
+   python pipeline/gsplat_training.py --dataset 数据1-人体 --steps 15000
+   ```
+
+   如果 7000 步还没收敛，增加到 15000 通常会改善颜色和边界；但如果初始点云/相机误差较大，只加步数会把错误结构“训练得更实”，不一定变平滑。
+
+4. **Gaussian 数量影响细节容量**  
+   默认 `--max-points 150000`。人体细节不够时可以试：
+
+   ```bash
+   python pipeline/gsplat_training.py --dataset 数据1-人体 --steps 15000 --max-points 250000
+   ```
+
+   点数更多会保留更多初始化细节，但显存、训练时间也会上升。
+
+5. **绿幕/背景处理会影响边界质量，场景数据不能按人体扣绿**  
+   默认 `--bg-mode auto` 会区分两类数据：`数据1-人体/数据2-人体` 有 mask，因此使用 `mask-black`；`数据3-场景` 没有 mask，因此使用 `original` 保留原图。场景数据如果被通道扣绿，会把真实画面里的绿色/亮色区域误删，3DGS 会变成黑底碎片。
+
+   人体数据也可以比较通道扣绿：
+
+   ```bash
+   python pipeline/gsplat_training.py --dataset 数据1-人体 --steps 15000 --bg-mode chroma-black
+   ```
+
+   如果 mask 边界过硬，人体边缘可能被切掉；如果 chroma key 太松，绿色会残留。可调：
+
+   ```bash
+   --chroma-min-green 0.25 --chroma-margin 0.08
+   ```
+
+6. **输入视角数量和覆盖范围很关键**  
+   人体数据只有 16 张图，视角覆盖有限。3DGS 对遮挡区域没有真实监督，只能靠初始化和邻近视角补，手脚、侧面、背面容易粗糙。增加输入视角、保证视角环绕均匀，比单纯增加训练步数更有效。
+
+推荐优先尝试的高质量命令：
+
+```bash
+python pipeline/gsplat_training.py --dataset 数据1-人体 --steps 15000 --max-points 250000 --bg-mode mask-black --foreground-loss-weight 8
+```
+
+场景数据推荐保留原图背景：
+
+```bash
+python pipeline/gsplat_training.py --dataset 数据3-场景 --steps 15000 --max-points 250000 --bg-mode original
+```
+
+如果显存或时间压力大，先用：
+
+```bash
+python pipeline/gsplat_training.py --dataset 数据1-人体 --steps 10000 --max-points 150000 --bg-mode mask-black --foreground-loss-weight 8
+```
 
 ## 实验结果对比（用于PPT）
 
@@ -250,9 +374,9 @@ python pipeline/analyze_experiments.py
 ### VGGT 与 3DGS 输出规模
 | 数据集 | 输入帧数 | VGGT有效点数 | BA地标点数 | Gaussians数量 | 训练曲线 |
 |--------|----------|--------------|------------|---------------|----------|
-| 数据1-人体 | 16 | 4,293,184 | 413 | 150,000 | `output/数据1-人体/gs_train_loss.png` |
-| 数据2-人体 | 16 | 4,293,184 | 382 | 150,000 | `output/数据2-人体/gs_train_loss.png` |
-| 数据3-场景 | 64 | 9,746,688 | 6,727 | 150,000 | `output/数据3-场景/gs_train_loss.png` |
+| 数据1-人体 | 16 | 4,293,184 | 413 | 150,000 | `output/数据1-人体/gsplat_train_loss.png` |
+| 数据2-人体 | 16 | 4,293,184 | 382 | 150,000 | `output/数据2-人体/gsplat_train_loss.png` |
+| 数据3-场景 | 64 | 9,746,688 | 6,727 | 150,000 | `output/数据3-场景/gsplat_train_loss.png` |
 
 ### VGGT深度统计
 | 数据集 | 图像尺寸 | 深度范围 | 平均深度 |
@@ -261,7 +385,7 @@ python pipeline/analyze_experiments.py
 | 数据2-人体 | 518×518 | [0.364, 1.573] | 0.815 |
 | 数据3-场景 | 294×518 | [0.060, 1.365] | 0.513 |
 
-> 当前 `inspect_results.py` 输出中没有记录 Best PSNR，因此这里使用 BA 重投影误差、点云规模、Gaussian 数量和训练损失曲线作为结果汇总。具体可视化文件包括 `pred_vis.png`、`ba_comparison.png`、`gs_distribution.png` 和 `gs_train_loss.png`。
+> 当前 `inspect_results.py` 输出中没有记录 Best PSNR，因此这里使用 BA 重投影误差、点云规模、Gaussian 数量和训练损失曲线作为结果汇总。具体可视化文件包括 `pred_vis.png`、`ba_comparison.png`、`gs_distribution.png` 和 `gsplat_train_loss.png`。
 
 ### BA 是否对 3DGS 有帮助
 
@@ -303,7 +427,7 @@ PPT 中建议展示：
 |--------|------|----------|
 | 使用 VGGT 求相机参数和初步点云 | 3分 | `vggt_inference.py` |
 | 编程实现 Bundle Adjustment | 4分 | `bundle_adjustment.py` |
-| 3D 高斯滤波优化 + 实时交互渲染 | 4分 | `gaussian_splatting.py` + `gradio_viewer.py` + `render_gaussian_image.py` |
+| 3D 高斯滤波优化 + 实时交互渲染 | 4分 | `gsplat_training.py` + `gsplat_viewer.py` + `gradio_viewer.py` |
 | VGGT 改进方法调研 | 3分 | `vggt_improvements.md` |
 | PPT 制作与答辩 | 6分 | — |
 
