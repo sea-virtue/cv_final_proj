@@ -5,8 +5,10 @@ pipeline/utils.py — 公共工具函数
 
 import os
 import sys
+import glob
 import numpy as np
 import torch
+import cv2
 from scipy.spatial.transform import Rotation
 
 # 确保能 import vggt 模块
@@ -173,6 +175,91 @@ def load_dataset_images_and_masks(dataset_path: str):
     ])
     image_names = [os.path.basename(p) for p in rgb_paths]
     return rgb_paths, msk_paths, image_names
+
+
+def get_dataset_image_paths(dataset_name: str, output_dir: str | None = None):
+    """
+    Return RGB/mask paths for a dataset. For video datasets this reads frames
+    previously extracted by vggt_inference.py from output/<dataset>/frames/.
+    """
+    datasets = get_dataset_list()
+    if dataset_name not in datasets:
+        raise FileNotFoundError(f"Dataset '{dataset_name}' not found. Available: {list(datasets.keys())}")
+
+    dataset_path = datasets[dataset_name]
+    if os.path.isfile(dataset_path) and os.path.splitext(dataset_path)[1].lower() in VIDEO_EXTENSIONS:
+        if output_dir is None:
+            output_dir = get_output_dir(dataset_name)
+        frames_dir = os.path.join(output_dir, "frames")
+        rgb_paths = sorted(glob.glob(os.path.join(frames_dir, "rgb_*.png")))
+        image_names = [os.path.basename(p) for p in rgb_paths]
+        return rgb_paths, [], image_names
+
+    return load_dataset_images_and_masks(dataset_path)
+
+
+def _target_size_from_max_dim(width: int, height: int, max_dim: int | None):
+    if max_dim is None or max_dim <= 0 or max(width, height) <= max_dim:
+        return width, height
+    scale = float(max_dim) / float(max(width, height))
+    return max(1, int(round(width * scale))), max(1, int(round(height * scale)))
+
+
+def load_rgb_images(
+    rgb_paths: list[str],
+    max_dim: int | None = None,
+    target_shape: tuple[int, int] | None = None,
+):
+    """
+    Load RGB images as float32 NHWC in [0, 1].
+
+    If target_shape=(H, W) is supplied, every image is resized exactly to that
+    shape. Otherwise max_dim limits the longer side while preserving aspect.
+    """
+    if not rgb_paths:
+        raise ValueError("No RGB image paths provided.")
+
+    images = []
+    target_wh = None
+    for path in rgb_paths:
+        bgr = cv2.imread(path, cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise FileNotFoundError(f"Cannot read image: {path}")
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        h, w = rgb.shape[:2]
+        if target_shape is not None:
+            out_h, out_w = target_shape
+        else:
+            if target_wh is None:
+                target_wh = _target_size_from_max_dim(w, h, max_dim)
+            out_w, out_h = target_wh
+        if (h, w) != (out_h, out_w):
+            interp = cv2.INTER_AREA if out_h < h or out_w < w else cv2.INTER_CUBIC
+            rgb = cv2.resize(rgb, (out_w, out_h), interpolation=interp)
+        images.append(rgb.astype(np.float32) / 255.0)
+
+    shapes = {img.shape for img in images}
+    if len(shapes) != 1:
+        raise ValueError(f"Loaded images have inconsistent shapes: {sorted(shapes)}")
+    return np.stack(images, axis=0)
+
+
+def load_mask_stack(mask_paths: list[str], target_shape: tuple[int, int], expected_count: int | None = None):
+    """Load binary masks as float32 NHW1, resized to target_shape=(H, W)."""
+    if not mask_paths:
+        return None
+    h, w = target_shape
+    masks = []
+    for mask_path in mask_paths:
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            continue
+        if mask.shape[:2] != (h, w):
+            mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+        masks.append((mask > 128).astype(np.float32))
+    if expected_count is not None and len(masks) != expected_count:
+        return None
+    return np.stack(masks, axis=0)[..., None] if masks else None
 
 
 def get_dataset_list():
