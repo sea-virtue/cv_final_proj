@@ -1,0 +1,29 @@
+{
+  "default_profile": "default",
+  "dataset_profiles": {
+    "数据1-人体": "human_conservative",
+    "数据2-人体": "human_conservative"
+  },
+  "profiles": {
+    "default": {},
+    "human_conservative": {
+      "point_source": "pointmap",
+      "camera_source": "vggt",
+      "steps": 3000,
+      "max_points": 120000,
+      "bg_mode": "foreground-only",
+      "foreground_loss_weight": 1.0,
+      "sh_degree": 0,
+      "ssim_lambda": 0.0,
+      "depth_loss_weight": 0.0,
+      "init_opacity": 0.35,
+      "init_conf_percentile": 70.0,
+      "random_bg": false,
+      "opacity_reg": 0.0,
+      "scale_reg": 0.005,
+      "refine_start": 999999,
+      "refine_stop": 1000000,
+      "packed": true
+    }
+  }
+}
