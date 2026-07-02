@@ -3,13 +3,6 @@ pipeline/gaussian_splatting.py — 3D Gaussian Splatting 训练
 用法:
     python pipeline/gaussian_splatting.py --dataset 数据1-人体
 
-原理:
-    1. 从 BA 优化结果 (或 VGGT 原始结果) 读取点云
-    2. 初始化 3D Gaussians: 位置/协方差/颜色/不透明度
-    3. 使用 gsplat 可微光栅化训练，最小化 L1+SSIM 损失
-    4. 实现 densification / pruning
-    5. 保存训练好的 Gaussians 为 .ply 文件
-
 输出: output/<dataset>/gaussians.ply
       output/<dataset>/gs_train_loss.png
 """
